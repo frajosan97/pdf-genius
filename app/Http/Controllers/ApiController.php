@@ -63,7 +63,7 @@ class ApiController extends Controller
             // Generate unique filename
             $filename = $this->generateUniqueFilename($request->template);
 
-            // Generate PDF using Browsershot
+            // Generate PDF using Browsershot with config
             $pdfContent = $this->generatePdfWithBrowsershot($html, $request->options ?? []);
 
             // Save PDF to storage
@@ -132,10 +132,10 @@ class ApiController extends Controller
 
         $htmlContent = $data['html_content'];
 
-        // Remove any extra escaping from the JSON
-        $htmlContent = stripslashes($htmlContent);
-
         try {
+            // Remove any extra escaping from the JSON
+            $htmlContent = stripslashes($htmlContent);
+
             // Try Blade::render first (Laravel 8+)
             if (method_exists(Blade::class, 'render')) {
                 $rendered = Blade::render($htmlContent, $data);
@@ -219,16 +219,16 @@ class ApiController extends Controller
      */
     private function renderBladeManually($html, $data)
     {
-        // Step 1: Handle @php blocks
+        // Handle @php blocks
         $html = $this->handlePhpBlocks($html, $data);
 
-        // Step 2: Handle @foreach loops
+        // Handle @foreach loops
         $html = $this->handleForeachLoops($html, $data);
 
-        // Step 3: Handle @if statements
+        // Handle @if statements
         $html = $this->handleIfStatements($html, $data);
 
-        // Step 4: Handle variables {{ $var }}
+        // Handle variables {{ $var }}
         $html = $this->handleVariables($html, $data);
 
         return $html;
@@ -245,13 +245,9 @@ class ApiController extends Controller
     {
         return preg_replace_callback('/@php(.*?)@endphp/s', function ($matches) use ($data) {
             try {
-                // Extract data for use in PHP block
                 extract($data);
                 ob_start();
-                $code = $matches[1];
-                // Remove any leading/trailing whitespace
-                $code = trim($code);
-                eval ($code);
+                eval ($matches[1]);
                 return ob_get_clean();
             } catch (\Exception $e) {
                 \Log::error('PHP block execution failed: ' . $e->getMessage());
@@ -274,12 +270,10 @@ class ApiController extends Controller
             $content = $matches[2];
 
             // Parse the foreach expression
-            // Support: $array as $item, $array as $key => $value
-            preg_match('/\$([a-zA-Z0-9_]+)(?:\s+as\s+(?:\$([a-zA-Z0-9_]+)\s+=>\s+)?\$([a-zA-Z0-9_]+))?/', $expression, $varMatches);
+            preg_match('/\$([a-zA-Z0-9_]+)\s+as\s+\$([a-zA-Z0-9_]+)/', $expression, $varMatches);
 
             $arrayName = $varMatches[1] ?? null;
-            $keyName = $varMatches[2] ?? null;
-            $itemName = $varMatches[3] ?? 'item';
+            $itemName = $varMatches[2] ?? 'item';
 
             if (!$arrayName || !isset($data[$arrayName])) {
                 return '';
@@ -294,15 +288,6 @@ class ApiController extends Controller
             foreach ($array as $key => $value) {
                 $itemData = $data;
                 $itemData[$itemName] = $value;
-                if ($keyName) {
-                    $itemData[$keyName] = $key;
-                }
-                // Also make the loop variable available
-                $itemData['loop'] = [
-                    'index' => $key,
-                    'first' => $key === array_key_first($array),
-                    'last' => $key === array_key_last($array),
-                ];
                 $result .= $this->renderBladeManually($content, $itemData);
             }
 
@@ -319,7 +304,6 @@ class ApiController extends Controller
      */
     private function handleIfStatements($html, $data)
     {
-        // Handle @if @elseif @else @endif
         return preg_replace_callback('/@if\(([^)]+)\)(.*?)(?:@elseif\(([^)]+)\)(.*?))?(?:@else(.*?))?@endif/s', function ($matches) use ($data) {
             $condition = trim($matches[1]);
             $ifContent = $matches[2];
@@ -344,7 +328,6 @@ class ApiController extends Controller
                 }
             } catch (\Exception $e) {
                 \Log::error('If statement evaluation failed: ' . $e->getMessage());
-                // On error, return the else content if available
                 if ($elseContent) {
                     return $this->renderBladeManually($elseContent, $data);
                 }
@@ -356,7 +339,7 @@ class ApiController extends Controller
     }
 
     /**
-     * Evaluate a condition expression safely
+     * Evaluate a condition expression
      *
      * @param string $condition
      * @param array $data
@@ -384,7 +367,7 @@ class ApiController extends Controller
                 return $value !== null ? var_export($value, true) : 'null';
             }, $condition);
 
-            // Handle null coalescing operator in conditions
+            // Handle null coalescing operator
             $condition = preg_replace_callback('/([^\s]+)\s*\?\?\s*([^\s]+)/', function ($matches) {
                 return "({$matches[1]} ?? {$matches[2]})";
             }, $condition);
@@ -394,17 +377,14 @@ class ApiController extends Controller
             $condition = str_replace(' or ', ' || ', $condition);
             $condition = str_replace('AND', '&&', $condition);
             $condition = str_replace('OR', '||', $condition);
-            $condition = str_replace('!==', '!=', $condition);
-            $condition = str_replace('===', '==', $condition);
 
-            // Evaluate the condition
             return eval ("return ({$condition});");
 
         } catch (\ParseError $e) {
-            \Log::error('Parse error in condition: ' . $e->getMessage() . ' Condition: ' . $condition);
+            \Log::error('Parse error in condition: ' . $e->getMessage());
             return false;
         } catch (\Exception $e) {
-            \Log::error('Condition evaluation failed: ' . $e->getMessage() . ' Condition: ' . $condition);
+            \Log::error('Condition evaluation failed: ' . $e->getMessage());
             return false;
         }
     }
@@ -421,7 +401,7 @@ class ApiController extends Controller
         return preg_replace_callback('/\{\{\s*(.+?)\s*\}\}/', function ($matches) use ($data) {
             $expression = trim($matches[1]);
 
-            // Handle null coalescing operator: $var ?? 'default'
+            // Handle null coalescing operator
             if (strpos($expression, '??') !== false) {
                 $parts = explode('??', $expression);
                 $var = trim($parts[0]);
@@ -433,12 +413,10 @@ class ApiController extends Controller
                     return $value;
                 }
 
-                // Return default value, removing quotes if present
                 $default = trim($default, '"\'');
                 return $default;
             }
 
-            // Simple variable or expression
             $value = $this->getVariableValue($expression, $data);
             return $value !== null ? $value : '';
         }, $html);
@@ -453,7 +431,7 @@ class ApiController extends Controller
      */
     private function getVariableValue($expression, $data)
     {
-        // Handle array access: $array['key'] or $array["key"]
+        // Handle array access
         if (preg_match('/\$([a-zA-Z0-9_]+)(?:\[[\'"]([a-zA-Z0-9_]+)[\'"]\])?/', $expression, $matches)) {
             $varName = $matches[1];
             $key = isset($matches[2]) ? $matches[2] : null;
@@ -465,7 +443,7 @@ class ApiController extends Controller
             }
         }
 
-        // Handle object property: $object->property
+        // Handle object property
         if (preg_match('/\$([a-zA-Z0-9_]+)->([a-zA-Z0-9_]+)/', $expression, $matches)) {
             $varName = $matches[1];
             $property = $matches[2];
@@ -480,16 +458,69 @@ class ApiController extends Controller
             return $data[$expression];
         }
 
-        // Handle numeric or boolean values
-        if (is_numeric($expression) || $expression === 'true' || $expression === 'false') {
-            return $expression;
-        }
-
         return null;
     }
 
     /**
-     * Generate PDF using Browsershot
+     * Get Node.js binary path from config with fallback
+     *
+     * @return string
+     */
+    private function getNodeBinaryPath()
+    {
+        // Try to get from config first
+        $nodePath = config('browsershot.node_binary');
+
+        // If config returns 'node' or null, check if it exists
+        if ($nodePath && $nodePath !== 'node' && file_exists($nodePath) && is_executable($nodePath)) {
+            \Log::info('Using Node.js from config: ' . $nodePath);
+            return $nodePath;
+        }
+
+        // If not found or not executable, try fallback paths from config
+        $fallbackPaths = config('browsershot.fallback_paths', []);
+
+        foreach ($fallbackPaths as $path) {
+            if (file_exists($path) && is_executable($path)) {
+                \Log::info('Using Node.js from fallback: ' . $path);
+                return $path;
+            }
+        }
+
+        // Last resort: use 'node' from system PATH
+        \Log::info('Using Node.js from system PATH');
+        return 'node';
+    }
+
+    /**
+     * Get Browsershot options from config
+     *
+     * @param array $requestOptions
+     * @return array
+     */
+    private function getBrowsershotOptions($requestOptions = [])
+    {
+        $defaultOptions = config('browsershot.options', []);
+
+        return [
+            'timeout' => $requestOptions['timeout'] ?? $defaultOptions['timeout'] ?? 120,
+            'delay' => $requestOptions['delay'] ?? $defaultOptions['delay'] ?? 2000,
+            'window_width' => $requestOptions['window_width'] ?? $defaultOptions['window_width'] ?? 1920,
+            'window_height' => $requestOptions['window_height'] ?? $defaultOptions['window_height'] ?? 1080,
+            'no_sandbox' => $requestOptions['no_sandbox'] ?? $defaultOptions['no_sandbox'] ?? true,
+            'paper_size' => $requestOptions['paper_size'] ?? $defaultOptions['paper_size'] ?? 'A4',
+            'orientation' => $requestOptions['orientation'] ?? $defaultOptions['orientation'] ?? 'portrait',
+            'margins' => [
+                'top' => $requestOptions['margin']['top'] ?? $defaultOptions['margins']['top'] ?? 10,
+                'right' => $requestOptions['margin']['right'] ?? $defaultOptions['margins']['right'] ?? 10,
+                'bottom' => $requestOptions['margin']['bottom'] ?? $defaultOptions['margins']['bottom'] ?? 10,
+                'left' => $requestOptions['margin']['left'] ?? $defaultOptions['margins']['left'] ?? 10,
+            ],
+        ];
+    }
+
+    /**
+     * Generate PDF using Browsershot with config
      *
      * @param string $html
      * @param array $options
@@ -501,17 +532,34 @@ class ApiController extends Controller
             // Create Browsershot instance
             $browsershot = new Browsershot();
 
-            // Set HTML content with proper encoding
+            // Get Node.js path from config
+            $nodePath = $this->getNodeBinaryPath();
+
+            // Set Node.js binary path
+            if ($nodePath && $nodePath !== 'node') {
+                $browsershot->setNodeBinary($nodePath);
+            }
+
+            // Get options from config
+            $bsOptions = $this->getBrowsershotOptions($options);
+
+            // Set Node.js environment PATH if configured
+            $nodeEnvPath = config('browsershot.node_env_path');
+            if ($nodeEnvPath && is_dir($nodeEnvPath)) {
+                putenv("PATH={$nodeEnvPath}:" . getenv('PATH'));
+            }
+
+            // Set HTML content with options
             $browsershot->setHtml($html)
                 ->noSandbox()
-                ->timeout(60)
-                ->windowSize(1920, 1080)
+                ->timeout($bsOptions['timeout'])
+                ->windowSize($bsOptions['window_width'], $bsOptions['window_height'])
                 ->waitUntilNetworkIdle()
-                ->setDelay(1000);
+                ->setDelay($bsOptions['delay']);
 
             // Paper size and orientation
-            $paperSize = $options['paper_size'] ?? 'A4';
-            $orientation = $options['orientation'] ?? 'portrait';
+            $paperSize = $bsOptions['paper_size'];
+            $orientation = $bsOptions['orientation'];
 
             // Set paper size
             $browsershot->setOption('paperWidth', $this->getPaperWidth($paperSize));
@@ -523,15 +571,11 @@ class ApiController extends Controller
             }
 
             // Set margins
-            $marginTop = isset($options['margin']['top']) ? $options['margin']['top'] : 10;
-            $marginRight = isset($options['margin']['right']) ? $options['margin']['right'] : 10;
-            $marginBottom = isset($options['margin']['bottom']) ? $options['margin']['bottom'] : 10;
-            $marginLeft = isset($options['margin']['left']) ? $options['margin']['left'] : 10;
-
-            $browsershot->setOption('marginTop', $marginTop)
-                ->setOption('marginRight', $marginRight)
-                ->setOption('marginBottom', $marginBottom)
-                ->setOption('marginLeft', $marginLeft);
+            $margins = $bsOptions['margins'];
+            $browsershot->setOption('marginTop', $margins['top'])
+                ->setOption('marginRight', $margins['right'])
+                ->setOption('marginBottom', $margins['bottom'])
+                ->setOption('marginLeft', $margins['left']);
 
             // Background and print options
             $browsershot->setOption('printBackground', true)
@@ -543,6 +587,7 @@ class ApiController extends Controller
             return $pdf;
 
         } catch (\Exception $e) {
+            \Log::error('Browsershot error: ' . $e->getMessage());
             throw new \Exception('Browsershot error: ' . $e->getMessage());
         }
     }
@@ -593,7 +638,6 @@ class ApiController extends Controller
      */
     private function validateApiKey($apiKey)
     {
-        // In production, check against database
         $validKeys = [
             'sk_live_xxxxx' => [
                 'status' => 'active',
@@ -651,7 +695,6 @@ class ApiController extends Controller
         $path = "pdfs/temp/{$filename}";
         Storage::disk('local')->put($path, $content);
 
-        // Store metadata
         $metadata = [
             'filename' => $filename,
             'expires_at' => Carbon::now()->addHour()->toISOString(),
@@ -721,7 +764,6 @@ class ApiController extends Controller
                 ], 404);
             }
 
-            // Check expiration
             $metadataPath = "pdfs/metadata/{$filename}.json";
             if (Storage::disk('local')->exists($metadataPath)) {
                 $metadata = json_decode(Storage::disk('local')->get($metadataPath), true);
