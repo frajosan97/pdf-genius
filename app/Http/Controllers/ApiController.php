@@ -89,11 +89,13 @@ class ApiController extends Controller
             $pdfUrl = $this->generatePdfUrl($filename);
 
             return response()->json([
+                'success' => true,
                 'pdf_url' => $pdfUrl,
                 'expires_in' => 3600,
                 'filename' => $filename,
                 'generated_at' => Carbon::now()->toISOString(),
-                'pages' => $this->getPdfPageCount($pdfContent)
+                'pages' => $this->getPdfPageCount($pdfContent),
+                'size' => strlen($pdfContent)
             ], 200);
 
         } catch (\Exception $e) {
@@ -101,6 +103,363 @@ class ApiController extends Controller
                 'error' => 'PDF generation failed',
                 'message' => $e->getMessage(),
                 'trace' => config('app.debug') ? $e->getTraceAsString() : null
+            ], 500);
+        }
+    }
+
+    /**
+     * Generate PDF from URL using Cloudflare
+     *
+     * @param Request $request
+     * @return \Illuminate\Http\JsonResponse
+     */
+    public function generateFromUrl(Request $request)
+    {
+        try {
+            // Validate API Key
+            $apiKey = $request->input('api_key');
+            if (!$this->validateApiKey($apiKey)) {
+                return response()->json([
+                    'error' => 'Invalid API key',
+                    'message' => 'The provided API key is invalid or expired.'
+                ], 401);
+            }
+
+            // Validate request
+            $validator = Validator::make($request->all(), [
+                'url' => 'required|url',
+                'options' => 'array|nullable',
+                'options.paper_size' => 'string|in:A4,A3,A5,Letter,Legal',
+                'options.orientation' => 'string|in:portrait,landscape',
+                'options.margin' => 'array|nullable',
+                'options.wait_until' => 'string|in:load,domcontentloaded,networkidle0,networkidle2',
+                'options.timeout' => 'integer|min:1000|max:60000',
+                'api_key' => 'required|string'
+            ]);
+
+            if ($validator->fails()) {
+                return response()->json([
+                    'error' => 'Validation failed',
+                    'errors' => $validator->errors()
+                ], 422);
+            }
+
+            // Generate unique filename
+            $filename = 'url_' . $this->generateUniqueFilename('webpage');
+
+            // Generate PDF using Cloudflare from URL
+            $pdfContent = $this->generatePdfFromUrlWithCloudflare($request->url, $request->options ?? []);
+
+            // Save PDF to storage
+            $this->savePdfToStorage($filename, $pdfContent);
+
+            // Generate URL
+            $pdfUrl = $this->generatePdfUrl($filename);
+
+            return response()->json([
+                'success' => true,
+                'pdf_url' => $pdfUrl,
+                'expires_in' => 3600,
+                'filename' => $filename,
+                'generated_at' => Carbon::now()->toISOString(),
+                'pages' => $this->getPdfPageCount($pdfContent),
+                'size' => strlen($pdfContent)
+            ], 200);
+
+        } catch (\Exception $e) {
+            return response()->json([
+                'error' => 'PDF generation from URL failed',
+                'message' => $e->getMessage(),
+                'trace' => config('app.debug') ? $e->getTraceAsString() : null
+            ], 500);
+        }
+    }
+
+    /**
+     * Generate PDF preview and return a temporary preview URL
+     *
+     * @param Request $request
+     * @return \Illuminate\Http\JsonResponse
+     */
+    public function previewPdf(Request $request)
+    {
+        try {
+            // Validate API Key
+            $apiKey = $request->input('api_key');
+            if (!$this->validateApiKey($apiKey)) {
+                return response()->json([
+                    'error' => 'Invalid API key',
+                    'message' => 'The provided API key is invalid or expired.'
+                ], 401);
+            }
+
+            // Validate request
+            $validator = Validator::make($request->all(), [
+                'template' => 'required|string|in:invoice,receipt,report,contract,certificate,custom',
+                'data' => 'required|array',
+                'data.html_content' => 'required_if:template,custom|string',
+                'options' => 'array|nullable',
+                'options.paper_size' => 'string|in:A4,A3,A5,Letter,Legal',
+                'options.orientation' => 'string|in:portrait,landscape',
+                'options.margin' => 'array|nullable',
+                'options.wait_until' => 'string|in:load,domcontentloaded,networkidle0,networkidle2',
+                'options.timeout' => 'integer|min:1000|max:60000',
+                'api_key' => 'required|string'
+            ]);
+
+            if ($validator->fails()) {
+                return response()->json([
+                    'error' => 'Validation failed',
+                    'errors' => $validator->errors()
+                ], 422);
+            }
+
+            // Generate HTML content
+            $html = $this->generateHtmlContent($request->template, $request->data);
+
+            // Debug: Save rendered HTML for inspection
+            if (config('app.debug', false)) {
+                Storage::disk('local')->put(
+                    'pdfs/debug/preview_rendered_' . time() . '.html',
+                    $html
+                );
+            }
+
+            // Generate unique filename with preview prefix
+            $filename = 'preview_' . $this->generateUniqueFilename($request->template);
+
+            // Generate PDF using Cloudflare
+            $pdfContent = $this->generatePdfWithCloudflare($html, $request->options ?? []);
+
+            // Save PDF to storage with shorter expiration (5 minutes for preview)
+            $this->savePreviewPdfToStorage($filename, $pdfContent);
+
+            // Generate preview URL (expires in 5 minutes)
+            $previewUrl = $this->generatePreviewUrl($filename);
+
+            return response()->json([
+                'success' => true,
+                'preview_url' => $previewUrl,
+                'expires_in' => 300, // 5 minutes
+                'filename' => $filename,
+                'generated_at' => Carbon::now()->toISOString(),
+                'pages' => $this->getPdfPageCount($pdfContent),
+                'size' => strlen($pdfContent)
+            ], 200);
+
+        } catch (\Exception $e) {
+            return response()->json([
+                'error' => 'PDF preview generation failed',
+                'message' => $e->getMessage(),
+                'trace' => config('app.debug') ? $e->getTraceAsString() : null
+            ], 500);
+        }
+    }
+
+    /**
+     * Download PDF
+     *
+     * @param Request $request
+     * @param string $filename
+     * @return \Illuminate\Http\Response|\Illuminate\Http\JsonResponse
+     */
+    public function downloadPdf(Request $request, $filename)
+    {
+        try {
+            if (!$request->hasValidSignature()) {
+                return response()->json([
+                    'error' => 'Invalid or expired signature',
+                    'message' => 'The download link is invalid or has expired.'
+                ], 401);
+            }
+
+            // Check both temp and preview directories
+            $paths = [
+                "pdfs/temp/{$filename}",
+                "pdfs/preview/{$filename}"
+            ];
+
+            $foundPath = null;
+            foreach ($paths as $path) {
+                if (Storage::disk('local')->exists($path)) {
+                    $foundPath = $path;
+                    break;
+                }
+            }
+
+            if (!$foundPath) {
+                return response()->json([
+                    'error' => 'PDF not found',
+                    'message' => 'The requested PDF does not exist or has been deleted.'
+                ], 404);
+            }
+
+            // Get metadata (check both locations)
+            $metadataPaths = [
+                "pdfs/metadata/{$filename}.json",
+                "pdfs/metadata/preview_{$filename}.json"
+            ];
+
+            $metadata = null;
+            $metadataPath = null;
+            foreach ($metadataPaths as $path) {
+                if (Storage::disk('local')->exists($path)) {
+                    $metadata = json_decode(Storage::disk('local')->get($path), true);
+                    $metadataPath = $path;
+                    break;
+                }
+            }
+
+            if ($metadata && Carbon::parse($metadata['expires_at'])->isPast()) {
+                Storage::disk('local')->delete($foundPath);
+                if ($metadataPath) {
+                    Storage::disk('local')->delete($metadataPath);
+                }
+                return response()->json([
+                    'error' => 'PDF expired',
+                    'message' => 'This PDF has expired and has been deleted.'
+                ], 410);
+            }
+
+            $fileContent = Storage::disk('local')->get($foundPath);
+
+            // Determine if it's a preview (use inline) or download (use attachment)
+            $disposition = strpos($filename, 'preview_') === 0 ? 'inline' : 'attachment';
+
+            $headers = [
+                'Content-Type' => 'application/pdf',
+                'Content-Disposition' => $disposition . '; filename="' . str_replace('preview_', '', $filename) . '"',
+                'Content-Length' => strlen($fileContent),
+                'Cache-Control' => 'private, max-age=300, must-revalidate'
+            ];
+
+            return response($fileContent, 200, $headers);
+
+        } catch (\Exception $e) {
+            return response()->json([
+                'error' => 'Download failed',
+                'message' => $e->getMessage()
+            ], 500);
+        }
+    }
+
+    /**
+     * Get PDF information
+     *
+     * @param Request $request
+     * @param string $filename
+     * @return \Illuminate\Http\JsonResponse
+     */
+    public function getPdfInfo(Request $request, $filename)
+    {
+        try {
+            // Check both temp and preview directories
+            $paths = [
+                "pdfs/temp/{$filename}",
+                "pdfs/preview/{$filename}"
+            ];
+
+            $foundPath = null;
+            foreach ($paths as $path) {
+                if (Storage::disk('local')->exists($path)) {
+                    $foundPath = $path;
+                    break;
+                }
+            }
+
+            if (!$foundPath) {
+                return response()->json([
+                    'error' => 'PDF not found',
+                    'message' => 'The requested PDF does not exist or has been deleted.'
+                ], 404);
+            }
+
+            // Get metadata (check both locations)
+            $metadataPaths = [
+                "pdfs/metadata/{$filename}.json",
+                "pdfs/metadata/preview_{$filename}.json"
+            ];
+
+            $metadata = null;
+            foreach ($metadataPaths as $path) {
+                if (Storage::disk('local')->exists($path)) {
+                    $metadata = json_decode(Storage::disk('local')->get($path), true);
+                    break;
+                }
+            }
+
+            $fileContent = Storage::disk('local')->get($foundPath);
+            $isExpired = $metadata ? Carbon::parse($metadata['expires_at'])->isPast() : false;
+
+            return response()->json([
+                'success' => true,
+                'filename' => $filename,
+                'size' => Storage::disk('local')->size($foundPath),
+                'pages' => $this->getPdfPageCount($fileContent),
+                'created_at' => $metadata['created_at'] ?? null,
+                'expires_at' => $metadata['expires_at'] ?? null,
+                'is_expired' => $isExpired,
+                'is_preview' => strpos($filename, 'preview_') === 0,
+                'storage_path' => $foundPath
+            ], 200);
+
+        } catch (\Exception $e) {
+            return response()->json([
+                'error' => 'Failed to get PDF info',
+                'message' => $e->getMessage()
+            ], 500);
+        }
+    }
+
+    /**
+     * Clean expired PDFs
+     *
+     * @return \Illuminate\Http\JsonResponse
+     */
+    public function cleanExpiredPdfs()
+    {
+        try {
+            $deleted = 0;
+            $deletedSize = 0;
+
+            // Get all metadata files
+            $metadataFiles = Storage::disk('local')->files('pdfs/metadata');
+
+            foreach ($metadataFiles as $metadataFile) {
+                $metadata = json_decode(Storage::disk('local')->get($metadataFile), true);
+
+                if (Carbon::parse($metadata['expires_at'])->isPast()) {
+                    $filename = $metadata['filename'];
+
+                    // Check both temp and preview directories
+                    $paths = [
+                        "pdfs/temp/{$filename}",
+                        "pdfs/preview/{$filename}"
+                    ];
+
+                    foreach ($paths as $path) {
+                        if (Storage::disk('local')->exists($path)) {
+                            $deletedSize += Storage::disk('local')->size($path);
+                            Storage::disk('local')->delete($path);
+                        }
+                    }
+
+                    Storage::disk('local')->delete($metadataFile);
+                    $deleted++;
+                }
+            }
+
+            return response()->json([
+                'success' => true,
+                'deleted' => $deleted,
+                'freed_space' => $this->formatFileSize($deletedSize),
+                'message' => "Cleaned up {$deleted} expired PDFs"
+            ]);
+
+        } catch (\Exception $e) {
+            return response()->json([
+                'error' => 'Cleanup failed',
+                'message' => $e->getMessage()
             ], 500);
         }
     }
@@ -211,12 +570,64 @@ class ApiController extends Controller
      * @param array $options
      * @return string
      */
-    public function generatePdfFromUrl($url, $options = [])
+    private function generatePdfFromUrlWithCloudflare($url, $options = [])
     {
         $payload = ['url' => $url];
 
-        // Add options as above
-        // ... (same options handling as in generatePdfWithCloudflare)
+        // Add optional parameters (same as generatePdfWithCloudflare)
+        if (!empty($options)) {
+            $pdfOptions = [];
+
+            if (isset($options['paper_size'])) {
+                $pdfOptions['format'] = $this->convertPaperSize($options['paper_size']);
+            }
+
+            if (isset($options['orientation']) && $options['orientation'] === 'landscape') {
+                $pdfOptions['landscape'] = true;
+            }
+
+            if (isset($options['margin'])) {
+                $pdfOptions['margin'] = [
+                    'top' => $this->convertMargin($options['margin']['top'] ?? '10px'),
+                    'bottom' => $this->convertMargin($options['margin']['bottom'] ?? '10px'),
+                    'left' => $this->convertMargin($options['margin']['left'] ?? '10px'),
+                    'right' => $this->convertMargin($options['margin']['right'] ?? '10px'),
+                ];
+            }
+
+            $pdfOptions['printBackground'] = true;
+            $pdfOptions['preferCSSPageSize'] = true;
+
+            if (!empty($pdfOptions)) {
+                $payload['pdfOptions'] = $pdfOptions;
+            }
+
+            $gotoOptions = [];
+            if (isset($options['wait_until'])) {
+                $gotoOptions['waitUntil'] = $options['wait_until'];
+            } else {
+                $gotoOptions['waitUntil'] = 'networkidle2';
+            }
+
+            if (isset($options['timeout'])) {
+                $gotoOptions['timeout'] = $options['timeout'];
+            } else {
+                $gotoOptions['timeout'] = 30000;
+            }
+
+            if (!empty($gotoOptions)) {
+                $payload['gotoOptions'] = $gotoOptions;
+            }
+
+            if (isset($options['viewport'])) {
+                $payload['viewport'] = $options['viewport'];
+            } else {
+                $payload['viewport'] = [
+                    'width' => 1920,
+                    'height' => 1080
+                ];
+            }
+        }
 
         $response = Http::withHeaders([
             'Authorization' => 'Bearer ' . $this->cloudflareApiToken,
@@ -258,12 +669,10 @@ class ApiController extends Controller
      */
     private function convertMargin($margin)
     {
-        // If margin is numeric, add 'px'
         if (is_numeric($margin)) {
             return $margin . 'px';
         }
 
-        // Ensure it has a unit
         if (!preg_match('/(px|mm|in|cm)$/', $margin)) {
             return $margin . 'px';
         }
@@ -720,6 +1129,30 @@ class ApiController extends Controller
     }
 
     /**
+     * Save preview PDF to storage with shorter expiration
+     *
+     * @param string $filename
+     * @param string $content
+     * @return void
+     */
+    private function savePreviewPdfToStorage($filename, $content)
+    {
+        $path = "pdfs/preview/{$filename}";
+        Storage::disk('local')->put($path, $content);
+
+        $metadata = [
+            'filename' => $filename,
+            'expires_at' => Carbon::now()->addMinutes(5)->toISOString(),
+            'created_at' => Carbon::now()->toISOString(),
+            'size' => strlen($content),
+            'generated_by' => 'Cloudflare Browser Rendering',
+            'is_preview' => true
+        ];
+
+        Storage::disk('local')->put("pdfs/metadata/preview_{$filename}.json", json_encode($metadata));
+    }
+
+    /**
      * Generate URL for PDF
      *
      * @param string $filename
@@ -728,6 +1161,22 @@ class ApiController extends Controller
     private function generatePdfUrl($filename)
     {
         $expiration = Carbon::now()->addHour();
+        return url()->temporarySignedRoute(
+            'pdf.download',
+            $expiration,
+            ['filename' => $filename]
+        );
+    }
+
+    /**
+     * Generate preview URL (shorter expiration)
+     *
+     * @param string $filename
+     * @return string
+     */
+    private function generatePreviewUrl($filename)
+    {
+        $expiration = Carbon::now()->addMinutes(5);
         return url()->temporarySignedRoute(
             'pdf.download',
             $expiration,
@@ -748,106 +1197,6 @@ class ApiController extends Controller
             return isset($matches[1]) ? (int) $matches[1] : 1;
         } catch (\Exception $e) {
             return 1;
-        }
-    }
-
-    /**
-     * Download PDF
-     *
-     * @param Request $request
-     * @param string $filename
-     * @return \Illuminate\Http\Response|\Illuminate\Http\JsonResponse
-     */
-    public function downloadPdf(Request $request, $filename)
-    {
-        try {
-            if (!$request->hasValidSignature()) {
-                return response()->json([
-                    'error' => 'Invalid or expired signature',
-                    'message' => 'The download link is invalid or has expired.'
-                ], 401);
-            }
-
-            $path = "pdfs/temp/{$filename}";
-
-            if (!Storage::disk('local')->exists($path)) {
-                return response()->json([
-                    'error' => 'PDF not found',
-                    'message' => 'The requested PDF does not exist or has been deleted.'
-                ], 404);
-            }
-
-            $metadataPath = "pdfs/metadata/{$filename}.json";
-            if (Storage::disk('local')->exists($metadataPath)) {
-                $metadata = json_decode(Storage::disk('local')->get($metadataPath), true);
-                if (Carbon::parse($metadata['expires_at'])->isPast()) {
-                    Storage::disk('local')->delete($path);
-                    Storage::disk('local')->delete($metadataPath);
-                    return response()->json([
-                        'error' => 'PDF expired',
-                        'message' => 'This PDF has expired and has been deleted.'
-                    ], 410);
-                }
-            }
-
-            $fileContent = Storage::disk('local')->get($path);
-            $headers = [
-                'Content-Type' => 'application/pdf',
-                'Content-Disposition' => 'attachment; filename="' . $filename . '"',
-                'Content-Length' => strlen($fileContent)
-            ];
-
-            return response($fileContent, 200, $headers);
-
-        } catch (\Exception $e) {
-            return response()->json([
-                'error' => 'Download failed',
-                'message' => $e->getMessage()
-            ], 500);
-        }
-    }
-
-    /**
-     * Clean expired PDFs
-     *
-     * @return \Illuminate\Http\JsonResponse
-     */
-    public function cleanExpiredPdfs()
-    {
-        try {
-            $deleted = 0;
-            $deletedSize = 0;
-            $metadataFiles = Storage::disk('local')->files('pdfs/metadata');
-
-            foreach ($metadataFiles as $metadataFile) {
-                $metadata = json_decode(Storage::disk('local')->get($metadataFile), true);
-
-                if (Carbon::parse($metadata['expires_at'])->isPast()) {
-                    $filename = $metadata['filename'];
-                    $pdfPath = "pdfs/temp/{$filename}";
-
-                    if (Storage::disk('local')->exists($pdfPath)) {
-                        $deletedSize += Storage::disk('local')->size($pdfPath);
-                        Storage::disk('local')->delete($pdfPath);
-                    }
-
-                    Storage::disk('local')->delete($metadataFile);
-                    $deleted++;
-                }
-            }
-
-            return response()->json([
-                'success' => true,
-                'deleted' => $deleted,
-                'freed_space' => $this->formatFileSize($deletedSize),
-                'message' => "Cleaned up {$deleted} expired PDFs"
-            ]);
-
-        } catch (\Exception $e) {
-            return response()->json([
-                'error' => 'Cleanup failed',
-                'message' => $e->getMessage()
-            ], 500);
         }
     }
 
