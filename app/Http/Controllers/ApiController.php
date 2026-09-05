@@ -6,14 +6,28 @@ use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Blade;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Facades\Validator;
-use Spatie\Browsershot\Browsershot;
 use Illuminate\Support\Str;
 use Carbon\Carbon;
+use Illuminate\Support\Facades\Http;
 
 class ApiController extends Controller
 {
     /**
-     * Generate PDF using Browsershot
+     * Cloudflare configuration
+     */
+    private $cloudflareAccountId;
+    private $cloudflareApiToken;
+    private $cloudflareEndpoint;
+
+    public function __construct()
+    {
+        $this->cloudflareAccountId = config('services.cloudflare.account_id', env('CLOUDFLARE_ACCOUNT_ID'));
+        $this->cloudflareApiToken = config('services.cloudflare.api_token', env('CLOUDFLARE_API_TOKEN'));
+        $this->cloudflareEndpoint = "https://api.cloudflare.com/client/v4/accounts/{$this->cloudflareAccountId}/browser-rendering/pdf";
+    }
+
+    /**
+     * Generate PDF using Cloudflare Browser Rendering
      *
      * @param Request $request
      * @return \Illuminate\Http\JsonResponse
@@ -39,6 +53,8 @@ class ApiController extends Controller
                 'options.paper_size' => 'string|in:A4,A3,A5,Letter,Legal',
                 'options.orientation' => 'string|in:portrait,landscape',
                 'options.margin' => 'array|nullable',
+                'options.wait_until' => 'string|in:load,domcontentloaded,networkidle0,networkidle2',
+                'options.timeout' => 'integer|min:1000|max:60000',
                 'api_key' => 'required|string'
             ]);
 
@@ -63,8 +79,8 @@ class ApiController extends Controller
             // Generate unique filename
             $filename = $this->generateUniqueFilename($request->template);
 
-            // Generate PDF using Browsershot with config
-            $pdfContent = $this->generatePdfWithBrowsershot($html, $request->options ?? []);
+            // Generate PDF using Cloudflare
+            $pdfContent = $this->generatePdfWithCloudflare($html, $request->options ?? []);
 
             // Save PDF to storage
             $this->savePdfToStorage($filename, $pdfContent);
@@ -87,6 +103,172 @@ class ApiController extends Controller
                 'trace' => config('app.debug') ? $e->getTraceAsString() : null
             ], 500);
         }
+    }
+
+    /**
+     * Generate PDF using Cloudflare Browser Rendering API
+     *
+     * @param string $html
+     * @param array $options
+     * @return string
+     */
+    private function generatePdfWithCloudflare($html, $options = [])
+    {
+        // Prepare Cloudflare request payload
+        $payload = [
+            'html' => $html,
+        ];
+
+        // Add optional parameters
+        if (!empty($options)) {
+            // PDF options
+            $pdfOptions = [];
+
+            // Paper size
+            if (isset($options['paper_size'])) {
+                $pdfOptions['format'] = $this->convertPaperSize($options['paper_size']);
+            }
+
+            // Orientation
+            if (isset($options['orientation']) && $options['orientation'] === 'landscape') {
+                $pdfOptions['landscape'] = true;
+            }
+
+            // Margins
+            if (isset($options['margin'])) {
+                $pdfOptions['margin'] = [
+                    'top' => $this->convertMargin($options['margin']['top'] ?? '10px'),
+                    'bottom' => $this->convertMargin($options['margin']['bottom'] ?? '10px'),
+                    'left' => $this->convertMargin($options['margin']['left'] ?? '10px'),
+                    'right' => $this->convertMargin($options['margin']['right'] ?? '10px'),
+                ];
+            }
+
+            // Print background
+            $pdfOptions['printBackground'] = true;
+            $pdfOptions['preferCSSPageSize'] = true;
+
+            if (!empty($pdfOptions)) {
+                $payload['pdfOptions'] = $pdfOptions;
+            }
+
+            // Goto options (load behavior)
+            $gotoOptions = [];
+            if (isset($options['wait_until'])) {
+                $gotoOptions['waitUntil'] = $options['wait_until'];
+            } else {
+                $gotoOptions['waitUntil'] = 'networkidle2';
+            }
+
+            if (isset($options['timeout'])) {
+                $gotoOptions['timeout'] = $options['timeout'];
+            } else {
+                $gotoOptions['timeout'] = 30000;
+            }
+
+            if (!empty($gotoOptions)) {
+                $payload['gotoOptions'] = $gotoOptions;
+            }
+
+            // Viewport
+            if (isset($options['viewport'])) {
+                $payload['viewport'] = $options['viewport'];
+            } else {
+                $payload['viewport'] = [
+                    'width' => 1920,
+                    'height' => 1080
+                ];
+            }
+        }
+
+        // Make the API request to Cloudflare
+        try {
+            $response = Http::withHeaders([
+                'Authorization' => 'Bearer ' . $this->cloudflareApiToken,
+                'Content-Type' => 'application/json',
+            ])->timeout(60)
+                ->post($this->cloudflareEndpoint, $payload);
+
+            if ($response->successful()) {
+                return $response->body();
+            }
+
+            // Handle error response
+            $errorData = $response->json();
+            $errorMessage = $errorData['errors'][0]['message'] ?? 'Unknown Cloudflare error';
+            throw new \Exception('Cloudflare API error: ' . $errorMessage . ' (Status: ' . $response->status() . ')');
+
+        } catch (\Exception $e) {
+            \Log::error('Cloudflare PDF generation failed: ' . $e->getMessage());
+            throw new \Exception('PDF generation failed: ' . $e->getMessage());
+        }
+    }
+
+    /**
+     * Generate PDF from URL using Cloudflare
+     *
+     * @param string $url
+     * @param array $options
+     * @return string
+     */
+    public function generatePdfFromUrl($url, $options = [])
+    {
+        $payload = ['url' => $url];
+
+        // Add options as above
+        // ... (same options handling as in generatePdfWithCloudflare)
+
+        $response = Http::withHeaders([
+            'Authorization' => 'Bearer ' . $this->cloudflareApiToken,
+            'Content-Type' => 'application/json',
+        ])->timeout(60)
+            ->post($this->cloudflareEndpoint, $payload);
+
+        if ($response->successful()) {
+            return $response->body();
+        }
+
+        throw new \Exception('Cloudflare API error: ' . $response->body());
+    }
+
+    /**
+     * Convert paper size to Cloudflare format
+     *
+     * @param string $size
+     * @return string
+     */
+    private function convertPaperSize($size)
+    {
+        $map = [
+            'A4' => 'a4',
+            'A3' => 'a3',
+            'A5' => 'a5',
+            'Letter' => 'letter',
+            'Legal' => 'legal',
+        ];
+
+        return $map[$size] ?? 'a4';
+    }
+
+    /**
+     * Convert margin to Cloudflare format (ensure it has px, mm, or in)
+     *
+     * @param string $margin
+     * @return string
+     */
+    private function convertMargin($margin)
+    {
+        // If margin is numeric, add 'px'
+        if (is_numeric($margin)) {
+            return $margin . 'px';
+        }
+
+        // Ensure it has a unit
+        if (!preg_match('/(px|mm|in|cm)$/', $margin)) {
+            return $margin . 'px';
+        }
+
+        return $margin;
     }
 
     /**
@@ -413,7 +595,7 @@ class ApiController extends Controller
                     return $value;
                 }
 
-                $default = trim($default, '"\''); // Fixed: removed extra backslash
+                $default = trim($default, '"\'');
                 return $default;
             }
 
@@ -459,221 +641,6 @@ class ApiController extends Controller
         }
 
         return null;
-    }
-
-    /**
-     * Get Node.js binary path from config
-     *
-     * @return string
-     */
-    private function getNodeBinaryPath()
-    {
-        // Try to get from config
-        $nodePath = config('browsershot.node_binary');
-
-        if ($nodePath && $nodePath !== 'node' && file_exists($nodePath) && is_executable($nodePath)) {
-            \Log::info('Using Node.js from config: ' . $nodePath);
-            return $nodePath;
-        }
-
-        // Try fallback paths from config
-        $fallbackPaths = config('browsershot.fallback_paths', []);
-        foreach ($fallbackPaths as $path) {
-            if (file_exists($path) && is_executable($path)) {
-                \Log::info('Using Node.js from fallback: ' . $path);
-                return $path;
-            }
-        }
-
-        // Last resort: use 'node' from system PATH
-        \Log::info('Using Node.js from system PATH');
-        return 'node';
-    }
-
-    /**
-     * Get Chromium/Chrome path from config
-     *
-     * @return string|null
-     */
-    private function getChromiumPath()
-    {
-        // Try primary path from config
-        $chromiumPath = config('browsershot.chromium_path');
-        if ($chromiumPath && file_exists($chromiumPath) && is_executable($chromiumPath)) {
-            \Log::info('Using Chromium from config: ' . $chromiumPath);
-            return $chromiumPath;
-        }
-
-        // Try fallback path from config
-        $fallbackPath = config('browsershot.chromium_fallback_path');
-        if ($fallbackPath && file_exists($fallbackPath) && is_executable($fallbackPath)) {
-            \Log::info('Using Chromium fallback: ' . $fallbackPath);
-            return $fallbackPath;
-        }
-
-        // Auto-detect from Puppeteer cache
-        $homePath = getenv('HOME');
-        if ($homePath) {
-            $cachePaths = [
-                $homePath . '/.cache/puppeteer/chrome/linux-*/chrome-linux64/chrome',
-                $homePath . '/.cache/puppeteer/chrome/linux-*/chrome-linux/chrome',
-            ];
-
-            foreach ($cachePaths as $path) {
-                $expandedPaths = glob($path);
-                if (!empty($expandedPaths) && file_exists($expandedPaths[0]) && is_executable($expandedPaths[0])) {
-                    \Log::info('Auto-detected Chromium: ' . $expandedPaths[0]);
-                    return $expandedPaths[0];
-                }
-            }
-        }
-
-        \Log::warning('Chromium/Chrome not found!');
-        return null;
-    }
-
-    /**
-     * Get Browsershot options from config
-     *
-     * @param array $requestOptions
-     * @return array
-     */
-    private function getBrowsershotOptions($requestOptions = [])
-    {
-        $defaultOptions = config('browsershot.options', []);
-
-        return [
-            'timeout' => $requestOptions['timeout'] ?? $defaultOptions['timeout'] ?? 300,
-            'delay' => $requestOptions['delay'] ?? $defaultOptions['delay'] ?? 5000,
-            'window_width' => $requestOptions['window_width'] ?? $defaultOptions['window_width'] ?? 1920,
-            'window_height' => $requestOptions['window_height'] ?? $defaultOptions['window_height'] ?? 1080,
-            'no_sandbox' => $requestOptions['no_sandbox'] ?? $defaultOptions['no_sandbox'] ?? true,
-            'paper_size' => $requestOptions['paper_size'] ?? $defaultOptions['paper_size'] ?? 'A4',
-            'orientation' => $requestOptions['orientation'] ?? $defaultOptions['orientation'] ?? 'portrait',
-            'margins' => [
-                'top' => $requestOptions['margin']['top'] ?? $defaultOptions['margins']['top'] ?? 10,
-                'right' => $requestOptions['margin']['right'] ?? $defaultOptions['margins']['right'] ?? 10,
-                'bottom' => $requestOptions['margin']['bottom'] ?? $defaultOptions['margins']['bottom'] ?? 10,
-                'left' => $requestOptions['margin']['left'] ?? $defaultOptions['margins']['left'] ?? 10,
-            ],
-        ];
-    }
-
-    /**
-     * Generate PDF using Browsershot with config
-     *
-     * @param string $html
-     * @param array $options
-     * @return string
-     */
-    private function generatePdfWithBrowsershot($html, $options = [])
-    {
-        try {
-            // Create Browsershot instance
-            $browsershot = new Browsershot();
-
-            // Get Node.js path from config
-            $nodePath = $this->getNodeBinaryPath();
-            if ($nodePath && $nodePath !== 'node') {
-                $browsershot->setNodeBinary($nodePath);
-            }
-
-            // Get Chromium path from config
-            $chromiumPath = $this->getChromiumPath();
-            if ($chromiumPath) {
-                $browsershot->setChromePath($chromiumPath);
-            }
-
-            // Set Node.js environment PATH if configured
-            $nodeEnvPath = config('browsershot.node_env_path');
-            if ($nodeEnvPath && is_dir($nodeEnvPath)) {
-                putenv("PATH={$nodeEnvPath}:" . getenv('PATH'));
-            }
-
-            // Get options from config
-            $bsOptions = $this->getBrowsershotOptions($options);
-
-            // Set HTML content with options
-            $browsershot->setHtml($html)
-                ->noSandbox()
-                ->timeout($bsOptions['timeout'])
-                ->windowSize($bsOptions['window_width'], $bsOptions['window_height'])
-                ->waitUntilNetworkIdle()
-                ->setDelay($bsOptions['delay']);
-
-            // Paper size and orientation
-            $paperSize = $bsOptions['paper_size'];
-            $orientation = $bsOptions['orientation'];
-
-            // Set paper size
-            $browsershot->setOption('paperWidth', $this->getPaperWidth($paperSize));
-            $browsershot->setOption('paperHeight', $this->getPaperHeight($paperSize));
-
-            // Set orientation
-            if ($orientation === 'landscape') {
-                $browsershot->setOption('landscape', true);
-            }
-
-            // Set margins
-            $margins = $bsOptions['margins'];
-            $browsershot->setOption('marginTop', $margins['top'])
-                ->setOption('marginRight', $margins['right'])
-                ->setOption('marginBottom', $margins['bottom'])
-                ->setOption('marginLeft', $margins['left']);
-
-            // Background and print options
-            $browsershot->setOption('printBackground', true)
-                ->setOption('preferCSSPageSize', true);
-
-            // Generate PDF
-            $pdf = $browsershot->pdf();
-
-            return $pdf;
-
-        } catch (\Exception $e) {
-            \Log::error('Browsershot error: ' . $e->getMessage());
-            \Log::error('Node path: ' . ($nodePath ?? 'Not set'));
-            \Log::error('Chromium path: ' . ($chromiumPath ?? 'Not found'));
-            throw new \Exception('Browsershot error: ' . $e->getMessage());
-        }
-    }
-
-    /**
-     * Get paper width in millimeters
-     *
-     * @param string $size
-     * @return float
-     */
-    private function getPaperWidth($size)
-    {
-        $sizes = [
-            'A4' => 210,
-            'A3' => 297,
-            'A5' => 148,
-            'Letter' => 215.9,
-            'Legal' => 215.9,
-        ];
-
-        return isset($sizes[$size]) ? $sizes[$size] : 210;
-    }
-
-    /**
-     * Get paper height in millimeters
-     *
-     * @param string $size
-     * @return float
-     */
-    private function getPaperHeight($size)
-    {
-        $sizes = [
-            'A4' => 297,
-            'A3' => 420,
-            'A5' => 210,
-            'Letter' => 279.4,
-            'Legal' => 355.6,
-        ];
-
-        return isset($sizes[$size]) ? $sizes[$size] : 297;
     }
 
     /**
@@ -746,7 +713,7 @@ class ApiController extends Controller
             'expires_at' => Carbon::now()->addHour()->toISOString(),
             'created_at' => Carbon::now()->toISOString(),
             'size' => strlen($content),
-            'generated_by' => 'Browsershot'
+            'generated_by' => 'Cloudflare Browser Rendering'
         ];
 
         Storage::disk('local')->put("pdfs/metadata/{$filename}.json", json_encode($metadata));
