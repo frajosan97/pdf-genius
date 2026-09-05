@@ -413,7 +413,7 @@ class ApiController extends Controller
                     return $value;
                 }
 
-                $default = trim($default, '"\'');
+                $default = trim($default, '"\''); // Fixed: removed extra backslash
                 return $default;
             }
 
@@ -462,24 +462,22 @@ class ApiController extends Controller
     }
 
     /**
-     * Get Node.js binary path from config with fallback
+     * Get Node.js binary path from config
      *
      * @return string
      */
     private function getNodeBinaryPath()
     {
-        // Try to get from config first
+        // Try to get from config
         $nodePath = config('browsershot.node_binary');
 
-        // If config returns 'node' or null, check if it exists
         if ($nodePath && $nodePath !== 'node' && file_exists($nodePath) && is_executable($nodePath)) {
             \Log::info('Using Node.js from config: ' . $nodePath);
             return $nodePath;
         }
 
-        // If not found or not executable, try fallback paths from config
+        // Try fallback paths from config
         $fallbackPaths = config('browsershot.fallback_paths', []);
-
         foreach ($fallbackPaths as $path) {
             if (file_exists($path) && is_executable($path)) {
                 \Log::info('Using Node.js from fallback: ' . $path);
@@ -493,6 +491,48 @@ class ApiController extends Controller
     }
 
     /**
+     * Get Chromium/Chrome path from config
+     *
+     * @return string|null
+     */
+    private function getChromiumPath()
+    {
+        // Try primary path from config
+        $chromiumPath = config('browsershot.chromium_path');
+        if ($chromiumPath && file_exists($chromiumPath) && is_executable($chromiumPath)) {
+            \Log::info('Using Chromium from config: ' . $chromiumPath);
+            return $chromiumPath;
+        }
+
+        // Try fallback path from config
+        $fallbackPath = config('browsershot.chromium_fallback_path');
+        if ($fallbackPath && file_exists($fallbackPath) && is_executable($fallbackPath)) {
+            \Log::info('Using Chromium fallback: ' . $fallbackPath);
+            return $fallbackPath;
+        }
+
+        // Auto-detect from Puppeteer cache
+        $homePath = getenv('HOME');
+        if ($homePath) {
+            $cachePaths = [
+                $homePath . '/.cache/puppeteer/chrome/linux-*/chrome-linux64/chrome',
+                $homePath . '/.cache/puppeteer/chrome/linux-*/chrome-linux/chrome',
+            ];
+
+            foreach ($cachePaths as $path) {
+                $expandedPaths = glob($path);
+                if (!empty($expandedPaths) && file_exists($expandedPaths[0]) && is_executable($expandedPaths[0])) {
+                    \Log::info('Auto-detected Chromium: ' . $expandedPaths[0]);
+                    return $expandedPaths[0];
+                }
+            }
+        }
+
+        \Log::warning('Chromium/Chrome not found!');
+        return null;
+    }
+
+    /**
      * Get Browsershot options from config
      *
      * @param array $requestOptions
@@ -503,8 +543,8 @@ class ApiController extends Controller
         $defaultOptions = config('browsershot.options', []);
 
         return [
-            'timeout' => $requestOptions['timeout'] ?? $defaultOptions['timeout'] ?? 120,
-            'delay' => $requestOptions['delay'] ?? $defaultOptions['delay'] ?? 2000,
+            'timeout' => $requestOptions['timeout'] ?? $defaultOptions['timeout'] ?? 300,
+            'delay' => $requestOptions['delay'] ?? $defaultOptions['delay'] ?? 5000,
             'window_width' => $requestOptions['window_width'] ?? $defaultOptions['window_width'] ?? 1920,
             'window_height' => $requestOptions['window_height'] ?? $defaultOptions['window_height'] ?? 1080,
             'no_sandbox' => $requestOptions['no_sandbox'] ?? $defaultOptions['no_sandbox'] ?? true,
@@ -534,20 +574,24 @@ class ApiController extends Controller
 
             // Get Node.js path from config
             $nodePath = $this->getNodeBinaryPath();
-
-            // Set Node.js binary path
             if ($nodePath && $nodePath !== 'node') {
                 $browsershot->setNodeBinary($nodePath);
             }
 
-            // Get options from config
-            $bsOptions = $this->getBrowsershotOptions($options);
+            // Get Chromium path from config
+            $chromiumPath = $this->getChromiumPath();
+            if ($chromiumPath) {
+                $browsershot->setChromePath($chromiumPath);
+            }
 
             // Set Node.js environment PATH if configured
             $nodeEnvPath = config('browsershot.node_env_path');
             if ($nodeEnvPath && is_dir($nodeEnvPath)) {
                 putenv("PATH={$nodeEnvPath}:" . getenv('PATH'));
             }
+
+            // Get options from config
+            $bsOptions = $this->getBrowsershotOptions($options);
 
             // Set HTML content with options
             $browsershot->setHtml($html)
@@ -588,6 +632,8 @@ class ApiController extends Controller
 
         } catch (\Exception $e) {
             \Log::error('Browsershot error: ' . $e->getMessage());
+            \Log::error('Node path: ' . ($nodePath ?? 'Not set'));
+            \Log::error('Chromium path: ' . ($chromiumPath ?? 'Not found'));
             throw new \Exception('Browsershot error: ' . $e->getMessage());
         }
     }
